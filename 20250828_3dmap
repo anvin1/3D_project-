@@ -1,0 +1,871 @@
+# mapping by tracking + 3d detect + triangular technique
+# created by vinh an, 28th august2025
+# deploy from o mod
+
+
+import os
+import numpy as np
+import torch
+import cv2
+from PIL import Image
+from pathlib import Path
+from tqdm import trange
+from ultralytics import YOLO
+import plotly.graph_objects as go
+from scipy.spatial.distance import directed_hausdorff
+from scipy.stats import mode
+from scipy.spatial.transform import Rotation as R
+import pickle
+import open3d as o3d
+import sys
+import logging
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+# Copyright (c) Meta Platforms, Inc. and affiliates
+import argparse
+from collections import OrderedDict
+import yaml
+from box import Box
+import colorsys
+import hashlib
+import io
+from tqdm import tqdm
+# Imports from detany3d code
+from train_utils import *
+from wrap_model import WrapModel
+import torch.nn as nn
+import torch.distributed as dist
+import random
+from groundingdino.util.inference import load_model as dino_load_model
+from groundingdino.util.inference import predict as dino_predict
+from torchvision.ops import box_convert
+import groundingdino.datasets.transforms as T
+import networkx as nx
+import itertools
+from segment_anything.utils.transforms import ResizeLongestSide
+import torch.nn.functional as F
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+sys.dont_write_bytecode = True
+sys.path.append(os.getcwd())
+np.set_printoptions(suppress=True)
+# Disable distributed initialization
+torch.distributed.is_available = lambda: False
+torch.distributed.is_initialized = lambda: False
+torch.distributed.get_world_size = lambda group=None: 1
+torch.distributed.get_rank = lambda group=None: 0
+# Configuration
+DATASET_ROOT = r"/root/ovmono3d/img_data"
+SCENE_ID = "id1"
+OUTPUT_DIR = "./output/tracking_exp"
+POSE_FILE = r"/root/ovmono3d/img_data/id1/traj.txt"
+INTRINSICS_FILE = r"/root/ovmono3d/img_data/id1/intrinsics.txt"
+MERGE_POSITION_THRESHOLD = 1
+IOU_THRESHOLD = 0.05
+CONFIDENCE_THRESHOLD = 0.3
+IMAGE_HEIGHT = 720
+IMAGE_WIDTH = 1280
+START_FRAME = 0
+END_FRAME = -1
+STRIDE = 1
+VIDEO_FPS = 30
+SMOOTHING_WINDOW = 5
+BASELINE_THRESHOLD = 0.5 # meters for keyframe selection
+GRID_SIZE = 3 # e.g., 3x3 grid inside bbox for point projection
+# DetAny3D configuration
+CONFIG_FILE = "./detect_anything/configs/demo.yaml"
+CATEGORY_NAMES = ['chair', 'table', 'cabinet', 'car', 'lamp', 'books', 'sofa', 'pedestrian', 'picture', 'window', 'pillow', 'truck', 'door', 'blinds', 'sink', 'shelves', 'television', 'shoes', 'cup', 'bottle', 'bookcase', 'desk', 'cereal box', 'floor mat', 'traffic cone', 'mirror', 'barrier', 'counter', 'camera', 'bicycle', 'toilet', 'bus', 'bed', 'refrigerator', 'trailer', 'box', 'oven', 'clothes', 'van', 'towel', 'motorcycle', 'night stand', 'stove', 'machine', 'stationery', 'bathtub', 'cyclist', 'curtain', 'bin']
+BOX_CLASS_INDEX = CATEGORY_NAMES.index('box') if 'box' in CATEGORY_NAMES else 0
+# Disable torch gradient computation
+torch.set_grad_enabled(False)
+def load_intrinsics(intrinsics_file):
+    try:
+        intrinsics = np.loadtxt(intrinsics_file, dtype=np.float32)
+        if intrinsics.shape != (3, 3):
+            raise ValueError(f"Invalid intrinsics shape in {intrinsics_file}: {intrinsics.shape}")
+        return intrinsics
+    except Exception as e:
+        raise ValueError(f"Failed to load intrinsics from {intrinsics_file}: {e}")
+def load_dataset(dataset_root, scene_id, pose_file, intrinsics_file, start, end, stride, image_height, image_width):
+    rgb_dir = Path(dataset_root) / scene_id / "rgb"
+    depth_dir = Path(dataset_root) / scene_id / "depth"
+    rgb_files = sorted(rgb_dir.glob("*.jpg"))
+    depth_files = sorted(depth_dir.glob("*.png"))
+    if not rgb_files or not depth_files:
+        raise FileNotFoundError(
+            f"Missing files in dataset: rgb={len(rgb_files)}, depth={len(depth_files)}"
+        )
+    try:
+        poses = np.loadtxt(pose_file).reshape(-1, 4, 4)
+    except Exception as e:
+        raise ValueError(f"Failed to load poses from {pose_file}: {e}")
+    intrinsics = load_intrinsics(intrinsics_file)
+    num_rgb = len(rgb_files)
+    num_depth = len(depth_files)
+    num_poses = poses.shape[0]
+    if num_rgb != num_depth or num_rgb != num_poses:
+        raise ValueError(
+            f"Mismatched file counts: rgb={num_rgb}, depth={num_depth}, poses={num_poses}"
+        )
+    end = num_rgb if end == -1 else min(end, num_rgb)
+    frame_indices = list(range(start, end, stride))
+    logger.info(f"Processing {len(frame_indices)} frames (indices {frame_indices[0]} to {frame_indices[-1]})")
+    logger.info(f"RGB files: {num_rgb}, Depth files: {num_depth}, Poses: {num_poses}")
+    dataset = []
+    for idx in frame_indices:
+        rgb_path = rgb_files[idx]
+        depth_path = depth_files[idx]
+        pose = poses[idx]
+        if pose.shape != (4, 4):
+            raise ValueError(f"Invalid pose shape for frame {idx} in {pose_file}: {pose.shape}")
+        rgb_image = cv2.imread(str(rgb_path)) # BGR
+        if rgb_image is None:
+            logger.error(f"Failed to load RGB image {rgb_path}. Skipping frame {idx}.")
+            continue
+        if rgb_image.shape[:2] != (image_height, image_width):
+            rgb_image = cv2.resize(rgb_image, (image_width, image_height))
+        # Try OpenCV for depth
+        depth_image = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth_image is None:
+            logger.warning(f"OpenCV failed to load depth image {depth_path}. Trying Pillow.")
+            try:
+                pil_img = Image.open(str(depth_path))
+                depth_image = np.array(pil_img)
+                if depth_image.ndim != 2:
+                    depth_image = cv2.cvtColor(depth_image, cv2.COLOR_RGB2GRAY)
+                logger.info(f"Loaded {depth_path} with Pillow.")
+            except Exception as e:
+                logger.error(f"Failed to load {depth_path}: {str(e)}. Skipping frame {idx}.")
+                continue
+        if depth_image.shape != (image_height, image_width):
+            depth_image = cv2.resize(depth_image, (image_width, image_height), interpolation=cv2.INTER_NEAREST)
+        depth_image = depth_image.astype(np.float32) / 1000.0
+        dataset.append({
+            "rgb_path": rgb_path,
+            "rgb": rgb_image,
+            "depth": depth_image,
+            "pose": pose,
+            "intrinsics": intrinsics,
+            "frame_idx": idx
+        })
+    return dataset
+def smooth_positions(positions, window=SMOOTHING_WINDOW):
+    if len(positions) < 2:
+        return positions
+    positions = np.array(positions)
+    smoothed = np.zeros_like(positions)
+    half_window = window // 2
+    for i in range(len(positions)):
+        start = max(0, i - half_window)
+        end = min(len(positions), i + half_window + 1)
+        smoothed[i] = np.mean(positions[start:end], axis=0)
+    return smoothed.tolist()
+def validate_bbox(bbox, image_width, image_height):
+    x1, y1, x2, y2 = bbox
+    if not (0 <= x1 < x2 <= image_width and 0 <= y1 < y2 <= image_height):
+        logger.warning(f"Invalid bbox: {bbox} for image size ({image_width}, {image_height})")
+        return False
+    return True
+def generate_image_token(image: np.ndarray) -> str:
+    image = Image.fromarray(image)
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format='PNG')
+    return hashlib.sha256(img_bytes.getvalue()).hexdigest()
+def convert_image(img):
+    transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    image_source = Image.fromarray(img, 'RGB')
+    image = np.asarray(image_source)
+    image_transformed, _ = transform(image_source, None)
+    return image, image_transformed
+def crop_hw(img):
+    if img.dim() == 4:
+        img = img.squeeze(0)
+    h, w = img.shape[1:3]
+    new_h = (h // 14) * 14
+    new_w = (w // 14) * 14
+    if new_h == 0 or new_w == 0:
+        logger.warning("Image dimensions too small after cropping.")
+        return None
+    center_h, center_w = h // 2, w // 2
+    start_h = center_h - new_h // 2
+    start_w = center_w - new_w // 2
+    img_cropped = img[:, start_h:start_h + new_h, start_w:start_w + new_w]
+    return img_cropped.unsqueeze(0)
+def preprocess(x, cfg):
+    sam_pixel_mean = torch.Tensor(cfg.dataset.pixel_mean).view(-1, 1, 1)
+    sam_pixel_std = torch.Tensor(cfg.dataset.pixel_std).view(-1, 1, 1)
+    x = (x - sam_pixel_mean) / sam_pixel_std
+    h, w = x.shape[-2:]
+    padh = cfg.model.pad - h
+    padw = cfg.model.pad - w
+    x = F.pad(x, (0, padw, 0, padh))
+    return x
+def preprocess_dino(x):
+    x = x / 255
+    IMAGENET_DATASET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
+    IMAGENET_DATASET_STD = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
+    x = (x - IMAGENET_DATASET_MEAN) / IMAGENET_DATASET_STD
+    return x
+def adjust_brightness(color, factor=1.5, v_min=0.3):
+    r, g, b = color
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    v = max(v, v_min) * factor
+    v = min(v, 1.0)
+    return colorsys.hsv_to_rgb(h, s, v)
+def draw_text(im, text, pos, scale=0.4, color='auto', font=cv2.FONT_HERSHEY_SIMPLEX, bg_color=(0, 255, 255),
+              blend=0.33, lineType=1):
+    text = str(text)
+    pos = [int(pos[0]), int(pos[1])]
+    if color == 'auto':
+        if bg_color is not None:
+            color = (0, 0, 0) if ((bg_color[0] + bg_color[1] + bg_color[2])/3) > 127.5 else (255, 255, 255)
+        else:
+            color = (0, 0, 0)
+    if bg_color is not None:
+        text_size, _ = cv2.getTextSize(text, font, scale, lineType)
+        x_s = int(np.clip(pos[0], a_min=0, a_max=im.shape[1]))
+        x_e = int(np.clip(x_s + text_size[0] - 1 + 4, a_min=0, a_max=im.shape[1]))
+        y_s = int(np.clip(pos[1] - text_size[1] - 2, a_min=0, a_max=im.shape[0]))
+        y_e = int(np.clip(pos[1] + 1 - 2, a_min=0, a_max=im.shape[0]))
+        im[y_s:y_e + 1, x_s:x_e + 1, 0] = im[y_s:y_e + 1, x_s:x_e + 1, 0]*blend + bg_color[0] * (1 - blend)
+        im[y_s:y_e + 1, x_s:x_e + 1, 1] = im[y_s:y_e + 1, x_s:x_e + 1, 1]*blend + bg_color[1] * (1 - blend)
+        im[y_s:y_e + 1, x_s:x_e + 1, 2] = im[y_s:y_e + 1, x_s:x_e + 1, 2]*blend + bg_color[2] * (1 - blend)
+        pos[0] = int(np.clip(pos[0] + 2, a_min=0, a_max=im.shape[1]))
+        pos[1] = int(np.clip(pos[1] - 2, a_min=0, a_max=im.shape[0]))
+    cv2.putText(im, text, tuple(pos), font, scale, color, lineType)
+def visualize_boxes(bboxes_3d, rot_mat, decoded_bboxes_pred_2d, label_list, pred_box_ious, adjusted_colors, origin_img, K_np):
+    if origin_img is None:
+        return None
+    todo = cv2.cvtColor(origin_img.permute(1, 2, 0).numpy(), cv2.COLOR_RGB2BGR)
+    for i in range(len(decoded_bboxes_pred_2d)):
+        if i >= len(adjusted_colors):
+            break
+        x, y, z, w, h, l, yaw = bboxes_3d[i].detach().cpu().numpy()
+        rot_mat_i = rot_mat[i].detach().cpu().numpy()
+        vertices_3d, fore_plane_center_3d = compute_3d_bbox_vertices(x, y, z, w, h, l, yaw, rot_mat_i)
+        vertices_2d = project_to_image(vertices_3d, K_np.squeeze(0))
+        fore_plane_center_2d = project_to_image(fore_plane_center_3d, K_np.squeeze(0))
+        color = adjusted_colors[i]
+        color = [min(255, c * 255) for c in color]
+        best_j = torch.argmax(pred_box_ious[i])
+        iou_score = pred_box_ious[i][best_j].item()
+        draw_bbox_2d(todo, vertices_2d, color=(int(color[0]), int(color[1]), int(color[2])), thickness=3)
+        if label_list[i] is not None:
+            bbox_2d = decoded_bboxes_pred_2d[i].detach().cpu().numpy()
+            xyxy = box_cxcywh_to_xyxy(bbox_2d)
+            dims_list = [round(c, 2) for c in bboxes_3d[i][3:6].detach().cpu().numpy().tolist()]
+            draw_text(todo, f"{label_list[i]} {dims_list}", xyxy, scale=0.50 * todo.shape[0] / 500, bg_color=color)
+    return todo
+def compute_overlap_penalty(centers, dims, edges):
+    penalty = 0.0
+    for i, j in edges:
+        c1, d1 = centers[i], dims[i]
+        c2, d2 = centers[j], dims[j]
+        diff = torch.abs(c1 - c2)
+        sum_half = (d1 + d2) / 2
+        overlap = torch.clamp(sum_half - diff, min=0.0)
+        inter = torch.prod(overlap)
+        union = torch.prod(d1) + torch.prod(d2) - inter
+        iou = inter / (union + 1e-6)
+        penalty += iou
+    return penalty / max(1, len(edges))
+def graph_refine_bboxes(bboxes_3d, rot_mat, iterations=20, lr=0.01, dist_thresh=5.0):
+    n = len(bboxes_3d)
+    if n < 2:
+        return bboxes_3d
+    centers = bboxes_3d[:, :3].clone().requires_grad_(True)
+    dims = bboxes_3d[:, 3:6].clone().requires_grad_(True)
+    optimizer = torch.optim.Adam([centers, dims], lr=lr)
+    graph = nx.Graph()
+    for i in range(n):
+        graph.add_node(i)
+    for i, j in itertools.combinations(range(n), 2):
+        dist = torch.norm(bboxes_3d[i, :3] - bboxes_3d[j, :3]).item()
+        if dist < dist_thresh:
+            graph.add_edge(i, j)
+    edges = list(graph.edges())
+    for _ in range(iterations):
+        optimizer.zero_grad()
+        ground_loss = torch.mean(torch.abs(centers[:, 1] - dims[:, 1] / 2))
+        overlap_penalty = compute_overlap_penalty(centers, dims, edges)
+        loss = ground_loss + 5.0 * overlap_penalty
+        if loss.grad_fn is None:
+            continue
+        loss.backward()
+        optimizer.step()
+        dims.data.clamp_(min=0.1)
+    refined_bboxes = bboxes_3d.clone()
+    refined_bboxes[:, :3] = centers.detach()
+    refined_bboxes[:, 3:6] = dims.detach()
+    return refined_bboxes
+def rotation_6d_to_matrix(rotation_6d):
+    if rotation_6d is None:
+        return None
+    rotation_6d = rotation_6d.view(-1, 6)
+    a1 = rotation_6d[:, 0:3]
+    a2 = rotation_6d[:, 3:6]
+    b1 = a1 / torch.norm(a1, dim=1, keepdim=True)
+    b2 = a2 - torch.sum(b1 * a2, dim=1, keepdim=True) * b1
+    b2 = b2 / torch.norm(b2, dim=1, keepdim=True)
+    b3 = torch.cross(b1, b2, dim=1)
+    return torch.stack((b1, b2, b3), dim=1)
+def box_cxcywh_to_xyxy(box):
+    x_c, y_c, w, h = box
+    x1 = x_c - w / 2
+    y1 = y_c - h / 2
+    x2 = x_c + w / 2
+    y2 = y_c + h / 2
+    return [x1, y1, x2, y2]
+def compute_3d_bbox_vertices(x, y, z, w, h, l, yaw, rot_mat):
+    center = np.array([x, y, z])
+    dims = np.array([w, h, l]) # Adjust order if necessary
+    half_dims = dims / 2
+    corners_local = np.array([
+        [half_dims[2], half_dims[0], -half_dims[1]],
+        [half_dims[2], -half_dims[0], -half_dims[1]],
+        [-half_dims[2], -half_dims[0], -half_dims[1]],
+        [-half_dims[2], half_dims[0], -half_dims[1]],
+        [half_dims[2], half_dims[0], half_dims[1]],
+        [half_dims[2], -half_dims[0], half_dims[1]],
+        [-half_dims[2], -half_dims[0], half_dims[1]],
+        [-half_dims[2], half_dims[0], half_dims[1]],
+    ]) # Adjusted for typical convention
+    corners_3d = (rot_mat @ corners_local.T).T + center
+    fore_plane_center_3d = corners_local[4:8] @ rot_mat.T + center # Top face or front
+    return corners_3d, fore_plane_center_3d
+def project_to_image(points_3d, K):
+    points_3d = np.asanyarray(points_3d)
+    projected = (K @ points_3d.T).T
+    projected_2d = projected[:, :2] / np.maximum(projected[:, 2][:, np.newaxis], 1e-6)
+    return projected_2d
+def draw_bbox_2d(im, vertices_2d, color, thickness):
+    edges = [[0,1], [1,2], [2,3], [3,0], [4,5], [5,6], [6,7], [7,4], [0,4], [1,5], [2,6], [3,7]]
+    for e in edges:
+        pt1 = tuple(map(int, vertices_2d[e[0]]))
+        pt2 = tuple(map(int, vertices_2d[e[1]]))
+        cv2.line(im, pt1, pt2, color, thickness)
+def get_3d_box_from_detany3d(model, cfg, rgb, K, bbox, class_index, threshold=CONFIDENCE_THRESHOLD):
+    try:
+        if not validate_bbox(bbox, IMAGE_WIDTH, IMAGE_HEIGHT):
+            return None, None, None, None, None, None
+        if rgb is None or rgb.shape is None or rgb.shape[2] != 3:
+            logger.warning("Invalid RGB image.")
+            return None, None, None, None, None, None
+        img = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB) # to RGB np.array
+        if img is None or img.shape is None:
+            return None, None, None, None, None, None
+        bbox_2d_list = [bbox.astype(int).tolist()]
+        label_list = [CATEGORY_NAMES[class_index]]
+        mode = 'box'
+        text = ''
+        raw_img = img.copy()
+        if raw_img is None or raw_img.shape is None:
+            return None, None, None, None, None, None
+        original_size = raw_img.shape[:2]
+        if original_size[0] == 0 or original_size[1] == 0:
+            return None, None, None, None, None, None
+        img_torch = torch.from_numpy(raw_img).permute(2, 0, 1).float().unsqueeze(0)
+        img_torch = sam_trans.apply_image_torch(img_torch)
+        img_torch = crop_hw(img_torch)
+        if img_torch is None:
+            return None, None, None, None, None, None
+        before_pad_size = tuple(img_torch.shape[2:])
+        img_for_sam = preprocess(img_torch, cfg).to('cuda:0')
+        img_for_dino = preprocess_dino(img_torch).to('cuda:0')
+        if cfg.model.vit_pad_mask:
+            vit_pad_size = (before_pad_size[0] // cfg.model.image_encoder.patch_size, before_pad_size[1] // cfg.model.image_encoder.patch_size)
+        else:
+            vit_pad_size = (cfg.model.pad // cfg.model.image_encoder.patch_size, cfg.model.pad // cfg.model.image_encoder.patch_size)
+        bbox_2d_tensor = torch.tensor(bbox_2d_list)
+        bbox_2d_tensor = sam_trans.apply_boxes_torch(bbox_2d_tensor, original_size).to(torch.int).to('cuda:0')
+        input_dict = {
+            "images": img_for_sam,
+            'vit_pad_size': torch.tensor(vit_pad_size).to('cuda:0').unsqueeze(0),
+            "images_shape": torch.Tensor(before_pad_size).to('cuda:0').unsqueeze(0),
+            "image_for_dino": img_for_dino,
+            "boxes_coords": bbox_2d_tensor,
+        }
+        ret_dict = model(input_dict)
+        if ret_dict is None or 'pred_pose_6d' not in ret_dict or ret_dict['pred_pose_6d'] is None:
+            logger.warning("Model output missing or invalid.")
+            return None, None, None, None, None, None
+        # Use provided K instead of predicted
+        # pred_K = torch.from_numpy(K).float().to('cuda:0').unsqueeze(0)
+        pred_K = ret_dict['intrinsics']  # Assumes shape (1, 3, 3) or (3, 3); add .unsqueeze(0)
+        decoded_bboxes_pred_2d, decoded_bboxes_pred_3d = decode_bboxes(ret_dict, cfg, pred_K)
+        # Robust conversion with try-except
+        try:
+            if isinstance(decoded_bboxes_pred_2d, list):
+                if len(decoded_bboxes_pred_2d) == 0:
+                    raise ValueError("Empty list for 2D bboxes")
+                if all(isinstance(x, torch.Tensor) for x in decoded_bboxes_pred_2d):
+                    decoded_bboxes_pred_2d = torch.stack(decoded_bboxes_pred_2d).to('cuda:0').float()
+                else:
+                    decoded_bboxes_pred_2d = torch.tensor(decoded_bboxes_pred_2d, device='cuda:0', dtype=torch.float32)
+            else:
+                decoded_bboxes_pred_2d = torch.as_tensor(decoded_bboxes_pred_2d, device='cuda:0', dtype=torch.float32)
+            if isinstance(decoded_bboxes_pred_3d, list):
+                if len(decoded_bboxes_pred_3d) == 0:
+                    raise ValueError("Empty list for 3D bboxes")
+                if all(isinstance(x, torch.Tensor) for x in decoded_bboxes_pred_3d):
+                    decoded_bboxes_pred_3d = torch.stack(decoded_bboxes_pred_3d).to('cuda:0').float()
+                else:
+                    decoded_bboxes_pred_3d = torch.tensor(decoded_bboxes_pred_3d, device='cuda:0', dtype=torch.float32)
+            else:
+                decoded_bboxes_pred_3d = torch.as_tensor(decoded_bboxes_pred_3d, device='cuda:0', dtype=torch.float32)
+        except ValueError as e:
+            logger.error(f"Failed to convert decoded bboxes: {e}. Raw types: 2D={type(decoded_bboxes_pred_2d)}, 3D={type(decoded_bboxes_pred_3d)}")
+            return None, None, None, None, None, None
+        logger.info(f"Decoded 2D type: {type(decoded_bboxes_pred_2d)}, shape: {decoded_bboxes_pred_2d.shape if hasattr(decoded_bboxes_pred_2d, 'shape') else 'N/A'}")
+        logger.info(f"Decoded 3D type: {type(decoded_bboxes_pred_3d)}, shape: {decoded_bboxes_pred_3d.shape if hasattr(decoded_bboxes_pred_3d, 'shape') else 'N/A'}")
+        if decoded_bboxes_pred_3d.numel() == 0:
+            return None, None, None, None, None, None
+        rot_mat = rotation_6d_to_matrix(ret_dict['pred_pose_6d'])
+        if rot_mat is None:
+            return None, None, None, None, None, None
+        pred_box_ious = ret_dict.get('pred_box_ious', torch.tensor([1.0]).to('cuda:0'))
+        K_torch = pred_K.squeeze(0)
+        decoded_bboxes_pred_3d = graph_refine_bboxes(decoded_bboxes_pred_3d, rot_mat)
+        center_cam = decoded_bboxes_pred_3d[0][:3].cpu().numpy()
+        dimensions = decoded_bboxes_pred_3d[0][3:6].cpu().numpy()
+        pose = rot_mat[0].cpu().numpy()
+        pred_class_idx = class_index
+        pred_score = threshold # Placeholder, adjust if needed
+        # Generate im_concat
+        adjusted_colors = [(0, 1, 0)]
+        img_slice = img_for_sam[0, :, :before_pad_size[0], :before_pad_size[1]].cpu()
+        origin_img = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1) * img_slice + torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        K_np = pred_K.detach().cpu().numpy()
+        im_drawn = visualize_boxes(decoded_bboxes_pred_3d, rot_mat, decoded_bboxes_pred_2d, label_list, pred_box_ious, adjusted_colors, origin_img, K_np)
+        if im_drawn is None:
+            return None, None, None, None, None, None
+        im_concat = im_drawn # Use drawn image as proxy for im_concat
+        return center_cam, dimensions, pose, pred_class_idx, pred_score, im_concat
+    except Exception as e:
+        logger.error(f"Error in get_3d_box_from_detany3d: {str(e)}")
+        return None, None, None, None, None, None
+def get_rotation_matrix(rotation):
+    rotation = np.array(rotation)
+    if rotation.ndim == 2 and rotation.shape == (3, 3):
+        return rotation
+    elif rotation.ndim == 1 and rotation.size == 9:
+        return rotation.reshape(3, 3)
+    elif rotation.ndim == 1 and rotation.size == 6:
+        rot = rotation.reshape(2, 3)
+        b1 = rot[0] / np.linalg.norm(rot[0])
+        b3 = np.cross(b1, rot[1])
+        b3 /= np.linalg.norm(b3)
+        b2 = np.cross(b3, b1)
+        return np.vstack((b1, b2, b3))
+    else:
+        raise ValueError(f"Unknown rotation shape: {rotation.shape}")
+def create_obb_from_world(center_world, dimensions, rotation):
+    try:
+        rotation_matrix = get_rotation_matrix(rotation)
+        r_correct = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
+        rotation_matrix = rotation_matrix @ r_correct
+        half_dims = dimensions / 2
+        corners_local = np.array([
+            [-half_dims[0], -half_dims[1], -half_dims[2]],
+            [half_dims[0], -half_dims[1], -half_dims[2]],
+            [half_dims[0], half_dims[1], -half_dims[2]],
+            [-half_dims[0], half_dims[1], -half_dims[2]],
+            [-half_dims[0], -half_dims[1], half_dims[2]],
+            [half_dims[0], -half_dims[1], half_dims[2]],
+            [half_dims[0], half_dims[1], half_dims[2]],
+            [-half_dims[0], half_dims[1], half_dims[2]],
+        ])
+        corners_world = (rotation_matrix @ corners_local.T).T + center_world
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(corners_world)
+        obb = pcd.get_oriented_bounding_box()
+        return obb
+    except Exception as e:
+        logger.error(f"Error in create_obb_from_world: {str(e)}")
+        return None
+def compute_aabb_iou(aabb1, aabb2):
+    if aabb1 is None or aabb2 is None:
+        return 0.0
+    min1 = aabb1.min_bound
+    max1 = aabb1.max_bound
+    min2 = aabb2.min_bound
+    max2 = aabb2.max_bound
+    inter_min = np.maximum(min1, min2)
+    inter_max = np.minimum(max1, max2)
+    inter_dims = np.maximum(0, inter_max - inter_min)
+    inter_vol = np.prod(inter_dims)
+    if inter_vol == 0:
+        return 0.0
+    vol1 = aabb1.volume()
+    vol2 = aabb2.volume()
+    union_vol = vol1 + vol2 - inter_vol
+    return inter_vol / union_vol
+def plot_global_topview(world_boxes, output_path):
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    for box in world_boxes:
+        center = box['center_world']
+        dims = box['dimensions']
+        rot = box['rotation_world']
+        half_dims = dims / 2
+        corners_local = np.array([
+            [hx, hy, hz]
+            for hx in [-half_dims[0], half_dims[0]]
+            for hy in [-half_dims[1], half_dims[1]]
+            for hz in [-half_dims[2], half_dims[2]]
+        ])
+        corners = (rot @ corners_local.T).T + center
+        edges = [
+            [0,1], [1,3], [3,2], [2,0], # bottom
+            [4,5], [5,7], [7,6], [6,4], # top
+            [0,4], [1,5], [2,6], [3,7] # sides
+        ]
+        for e in edges:
+            ax.plot(corners[e, 0], corners[e, 1], corners[e, 2], 'b-')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.view_init(elev=90, azim=0) # Top-down view
+    if world_boxes:
+        all_points = np.vstack([box['center_world'] for box in world_boxes])
+        margin = np.max([box['dimensions'] for box in world_boxes], axis=0) / 2 + 1
+        min_p = np.min(all_points, axis=0) - margin
+        max_p = np.max(all_points, axis=0) + margin
+        ax.set_xlim(min_p[0], max_p[0])
+        ax.set_ylim(min_p[1], max_p[1])
+        ax.set_zlim(min_p[2], max_p[2])
+    plt.savefig(output_path)
+    plt.close()
+def deproject_point(u, v, depth, intrinsics, pose):
+    if depth <= 0 or np.isnan(depth) or np.isinf(depth):
+        return None
+    z = depth
+    x = (u - intrinsics[0, 2]) * z / intrinsics[0, 0]
+    y = (v - intrinsics[1, 2]) * z / intrinsics[1, 1]
+    point_camera = np.array([x, y, z, 1.0])
+    point_world = pose @ point_camera
+    if np.any(np.isnan(point_world)) or np.any(np.isinf(point_world)):
+        return None
+    return point_world[:3]
+def main():
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    visualizations_dir = output_dir / "visualizations"
+    visualizations_dir.mkdir(parents=True, exist_ok=True)
+    yolo_model = YOLO('yolov8l-world.pt')
+    yolo_model.set_classes(CATEGORY_NAMES)
+    video_path = output_dir / 'tracking_video.mp4'
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(str(video_path), fourcc, VIDEO_FPS, (IMAGE_WIDTH, IMAGE_HEIGHT))
+    dataset = load_dataset(
+        dataset_root=DATASET_ROOT,
+        scene_id=SCENE_ID,
+        pose_file=POSE_FILE,
+        intrinsics_file=INTRINSICS_FILE,
+        start=START_FRAME,
+        end=END_FRAME,
+        stride=STRIDE,
+        image_height=IMAGE_HEIGHT,
+        image_width=IMAGE_WIDTH
+    )
+    tracks = {}
+    ovmono_cache = {} # Cache: (frame_idx, bbox_tuple): (center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat)
+    for frame_idx in trange(len(dataset)):
+        frame = dataset[frame_idx]
+        rgb_path = frame["rgb_path"]
+        image_rgb = frame["rgb"]
+        depth_array = frame["depth"]
+        pose = frame["pose"]
+        intrinsics = frame["intrinsics"]
+        results = yolo_model.track(source=str(rgb_path), conf=CONFIDENCE_THRESHOLD, verbose=False, persist=True)
+        detections = results[0].boxes
+        xyxy = detections.xyxy.cpu().numpy()
+        confidences = detections.conf.cpu().numpy()
+        track_ids = detections.id.cpu().numpy() if detections.id is not None else np.arange(len(xyxy))
+        class_ids = detections.cls.cpu().numpy().astype(int)
+        class_names_detected = [CATEGORY_NAMES[class_id] for class_id in class_ids]
+        annotated_frame = image_rgb.copy()
+        for i, (bbox, conf, track_id, class_name) in enumerate(zip(xyxy, confidences, track_ids, class_names_detected)):
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"{class_name} ID:{int(track_id)} Conf:{conf:.2f}"
+            cv2.putText(
+                annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 0), 2
+            )
+        video_writer.write(annotated_frame)
+        for i, (bbox, conf, track_id, class_id, class_name) in enumerate(zip(xyxy, confidences, track_ids, class_ids, class_names_detected)):
+            track_id = int(track_id)
+            if track_id not in tracks:
+                tracks[track_id] = {
+                    'centers': [],
+                    'point_cloud': [],
+                    'bboxes': [],
+                    'confidences': [],
+                    'class_ids': [],
+                    'frame_indices': [],
+                    'best_conf': 0.0,
+                    'best_frame_idx': None
+                }
+            x1, y1, x2, y2 = map(int, bbox)
+            center_y = (y1 + y2) / 2
+            center_x = (x1 + x2) / 2
+            depth = depth_array[int(center_y), int(center_x)]
+            center_world = deproject_point(center_x, center_y, depth, intrinsics, pose)
+            if center_world is not None:
+                tracks[track_id]['centers'].append(center_world)
+            us = np.linspace(x1, x2 - 1, GRID_SIZE, dtype=int)
+            vs = np.linspace(y1, y2 - 1, GRID_SIZE, dtype=int)
+            for u in us:
+                for v in vs:
+                    depth = depth_array[v, u]
+                    point_world = deproject_point(u, v, depth, intrinsics, pose)
+                    if point_world is not None:
+                        tracks[track_id]['point_cloud'].append(point_world)
+            tracks[track_id]['bboxes'].append(bbox)
+            tracks[track_id]['confidences'].append(conf)
+            tracks[track_id]['class_ids'].append(class_id)
+            tracks[track_id]['frame_indices'].append(frame_idx)
+            if conf > tracks[track_id]['best_conf']:
+                tracks[track_id]['best_conf'] = conf
+                tracks[track_id]['best_frame_idx'] = frame_idx
+    video_writer.release()
+    # Compute fused 3D box for each track using keyframes
+    for track_id, track_data in list(tracks.items()):
+        if track_data['best_conf'] < CONFIDENCE_THRESHOLD or len(track_data['centers']) < 3:
+            logger.info(f"Skipping track {track_id}: best_conf={track_data['best_conf']:.2f}, centers={len(track_data['centers'])}")
+            del tracks[track_id]
+            continue
+        sorted_indices = sorted(range(len(track_data['frame_indices'])), key=lambda k: track_data['frame_indices'][k])
+        sorted_frames = [track_data['frame_indices'][si] for si in sorted_indices]
+        sorted_poses = [dataset[f]['pose'] for f in sorted_frames]
+        key_indices = [0]
+        prev_pose = sorted_poses[0]
+        for k in range(1, len(sorted_poses)):
+            baseline = np.linalg.norm(sorted_poses[k][:3, 3] - prev_pose[:3, 3])
+            if baseline > BASELINE_THRESHOLD:
+                key_indices.append(k)
+                prev_pose = sorted_poses[k]
+        if not key_indices:
+            del tracks[track_id]
+            continue
+        centers_world = []
+        dims_list = []
+        rots_world = []
+        classes_k = []
+        scores_k = []
+        im_concats = []
+        for ki in key_indices:
+            kf = sorted_frames[ki]
+            idx_in_track = sorted_indices[ki]
+            bbox = track_data['bboxes'][idx_in_track]
+            class_id = track_data['class_ids'][idx_in_track]
+            frame = dataset[kf]
+            rgb = frame['rgb']
+            K = frame['intrinsics']
+            pose = frame['pose']
+            cache_key = (kf, tuple(bbox))
+            if cache_key in ovmono_cache:
+                center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat = ovmono_cache[cache_key]
+            else:
+                center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat = get_3d_box_from_detany3d(model, cfg, rgb, K, bbox, class_id)
+                ovmono_cache[cache_key] = (center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat)
+            if center_cam is None:
+                continue
+            center_homog = np.append(center_cam, 1.0)
+            center_world = (pose @ center_homog)[:3]
+            rotation_matrix = get_rotation_matrix(rotation)
+            rotation_world = pose[:3, :3] @ rotation_matrix
+            centers_world.append(center_world)
+            dims_list.append(dimensions)
+            rots_world.append(rotation_world)
+            classes_k.append(pred_class_idx)
+            scores_k.append(pred_score)
+            im_concats.append((im_concat, pred_score))
+        if not centers_world:
+            logger.warning(f"Track {track_id}: No valid DetAny3D estimates from keyframes")
+            del tracks[track_id]
+            continue
+        fused_class = mode(classes_k).mode.item() if len(mode(classes_k).mode) > 0 else classes_k[0]
+        fused_score = max(scores_k)
+        fused_center = np.mean(centers_world, axis=0)
+        fused_dims = np.mean(dims_list, axis=0)
+        quats = [R.from_matrix(r).as_quat() for r in rots_world]
+        fused_quat = np.mean(quats, axis=0)
+        fused_quat /= np.linalg.norm(fused_quat)
+        fused_rot = R.from_quat(fused_quat).as_matrix()
+        track_data['best_box_world'] = {
+            'center_world': fused_center,
+            'dimensions': fused_dims,
+            'rotation_world': fused_rot,
+            'class_idx': fused_class,
+            'score': fused_score
+        }
+        obb = create_obb_from_world(fused_center, fused_dims, fused_rot)
+        if obb is None:
+            del tracks[track_id]
+            continue
+        track_data['obb'] = obb
+        best_im_idx = np.argmax([s for _, s in im_concats])
+        im_concat = im_concats[best_im_idx][0]
+        combine_path = visualizations_dir / f"track_{track_id}_combine.jpg"
+        cv2.imwrite(str(combine_path), im_concat)
+        logger.info(f"Saved combine image for track {track_id} to {combine_path}")
+    track_ids = list(tracks.keys())
+    if track_ids:
+        classes = [tracks[tid]['best_box_world']['class_idx'] for tid in track_ids]
+        obbs = [tracks[tid]['obb'] for tid in track_ids]
+        positions_list = [np.array(tracks[tid]['point_cloud']) for tid in track_ids]
+        parents = {tid: tid for tid in track_ids}
+        def find(x):
+            if parents[x] != x:
+                parents[x] = find(parents[x])
+            return parents[x]
+        def union(x, y):
+            px = find(x)
+            py = find(y)
+            if px != py:
+                parents[px] = py
+        for i in range(len(track_ids)):
+            for j in range(i + 1, len(track_ids)):
+                tid1 = track_ids[i]
+                tid2 = track_ids[j]
+                pos1 = positions_list[i]
+                pos2 = positions_list[j]
+                if len(pos1) == 0 or len(pos2) == 0:
+                    continue
+                haus_ab = directed_hausdorff(pos1, pos2)[0]
+                haus_ba = directed_hausdorff(pos2, pos1)[0]
+                haus = max(haus_ab, haus_ba)
+                class1 = classes[i]
+                class2 = classes[j]
+                if haus < MERGE_POSITION_THRESHOLD * 2:
+                    aabb1 = obbs[i].get_axis_aligned_bounding_box()
+                    aabb2 = obbs[j].get_axis_aligned_bounding_box()
+                    iou = compute_aabb_iou(aabb1, aabb2)
+                    log_msg = f"Potential merge between {tid1} and {tid2}: haus_dist={haus:.3f}, class1={class1}, class2={class2}, iou={iou:.3f}"
+                    if haus < MERGE_POSITION_THRESHOLD and class1 == class2 and iou > IOU_THRESHOLD:
+                        union(tid1, tid2)
+                        log_msg += " -> MERGED"
+                    else:
+                        log_msg += " -> NOT MERGED"
+                    logger.info(log_msg)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for tid in track_ids:
+            groups[find(tid)].append(tid)
+        for root, members in groups.items():
+            if len(members) <= 1:
+                continue
+            for mem in members:
+                if mem == root:
+                    continue
+                tracks[root]['centers'].extend(tracks[mem]['centers'])
+                tracks[root]['point_cloud'].extend(tracks[mem]['point_cloud'])
+                tracks[root]['bboxes'].extend(tracks[mem]['bboxes'])
+                tracks[root]['confidences'].extend(tracks[mem]['confidences'])
+                tracks[root]['class_ids'].extend(tracks[mem]['class_ids'])
+                tracks[root]['frame_indices'].extend(tracks[mem]['frame_indices'])
+                if tracks[mem]['best_conf'] > tracks[root]['best_conf']:
+                    tracks[root]['best_conf'] = tracks[mem]['best_conf']
+                    tracks[root]['best_frame_idx'] = tracks[mem]['best_frame_idx']
+                    tracks[root]['best_box_world'] = tracks[mem]['best_box_world']
+                    tracks[root]['obb'] = tracks[mem]['obb']
+            for mem in members:
+                if mem != root:
+                    del tracks[mem]
+    for track_id in tracks:
+        if tracks[track_id]['centers']:
+            tracks[track_id]['centers'] = smooth_positions(tracks[track_id]['centers'], SMOOTHING_WINDOW)
+    obb_meshes = []
+    world_boxes = []
+    for track_id, track_data in tracks.items():
+        if 'best_box_world' not in track_data:
+            continue
+        best_box = track_data['best_box_world']
+        world_boxes.append({
+            'center_world': best_box['center_world'],
+            'dimensions': best_box['dimensions'],
+            'rotation_world': best_box['rotation_world'],
+            'class_name': CATEGORY_NAMES[best_box['class_idx']],
+            'score': best_box['score'],
+            'track_id': track_id
+        })
+        obb = track_data['obb']
+        if obb is None:
+            continue
+        obb_mesh = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(obb, scale=[1, 1, 1])
+        obb_mesh.paint_uniform_color([0, 1, 0])
+        obb_file = output_dir / f'track_{track_id}_box.ply'
+        o3d.io.write_triangle_mesh(str(obb_file), obb_mesh, write_ascii=True, write_vertex_normals=False, write_vertex_colors=True)
+        logger.info(f"Saved OBB for track {track_id} to {obb_file}")
+        obb_meshes.append(obb_mesh)
+    if obb_meshes:
+        combined_obb_mesh = obb_meshes[0]
+        for mesh in obb_meshes[1:]:
+            combined_obb_mesh += mesh
+        combined_obb_file = output_dir / 'all_bboxes_3d.ply'
+        o3d.io.write_triangle_mesh(
+            str(combined_obb_file),
+            combined_obb_mesh,
+            write_ascii=True,
+            write_vertex_normals=False,
+            write_vertex_colors=True
+        )
+        logger.info(f"Saved combined OBBs for {len(obb_meshes)} tracks to {combined_obb_file}")
+    for track_data in tracks.values():
+        if 'obb' in track_data:
+            del track_data['obb']
+    with open(output_dir / 'tracked_objects.pkl', 'wb') as f:
+        pickle.dump(tracks, f)
+    data = []
+    for track_id, track_data in tracks.items():
+        positions = np.array(track_data['centers'])
+        if len(positions) == 0:
+            continue
+        trace = go.Scatter3d(
+            x=positions[:, 0],
+            y=positions[:, 1],
+            z=positions[:, 2],
+            mode='markers',
+            name=f'Track {track_id} ({CATEGORY_NAMES[track_data["class_ids"][0]]})',
+            marker=dict(size=5)
+        )
+        data.append(trace)
+    layout = go.Layout(
+        title='3D Object Tracks',
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+    fig = go.Figure(data=data, layout=layout)
+    fig.write_html(str(output_dir / 'tracked_points_3d.html'))
+    if world_boxes:
+        plot_global_topview(world_boxes, str(output_dir / 'global_topview.png'))
+        logger.info(f"Saved global top-view image to {output_dir / 'global_topview.png'}")
+if __name__ == "__main__":
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        cfg_dict = yaml.load(f.read(), Loader=yaml.FullLoader)
+    cfg = Box(cfg_dict)
+    model = WrapModel(cfg)
+    checkpoint = torch.load(cfg.resume, map_location='cuda:0')
+    new_model_dict = model.state_dict()
+    for k, v in new_model_dict.items():
+        if k in checkpoint['state_dict'].keys() and checkpoint['state_dict'][k].size() == new_model_dict[k].size():
+            new_model_dict[k] = checkpoint['state_dict'][k].detach()
+    model.load_state_dict(new_model_dict)
+    model.to('cuda:0')
+    model.setup()
+    model.eval()
+    sam_trans = ResizeLongestSide(cfg.model.pad)
+    main()
