@@ -1,0 +1,231 @@
+# this is the unity file for transfer data json into Unity
+
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using System.IO;
+using System.Text;
+using UnityEngine.Networking;
+using TMPro;
+
+[System.Serializable]
+public class Detection
+{
+    public string category;
+    public float score;
+    public float[] center_cam;
+    public float[] dimensions;
+    public float[] pose1; // Rotation matrix
+    public float[] pose2;
+    public float[] pose3;
+    public float[] color;
+}
+
+[System.Serializable]
+public class DetectionList
+{
+    public List<Detection> detections;
+}
+
+public class BoundingBoxManager : MonoBehaviour
+{
+    // Add references to some specific prefabs for different categories
+    public GameObject boundingBoxPrefab;
+    public GameObject tablePrefab;
+    public GameObject chairPrefab;
+    public GameObject deskPrefab;
+    public GameObject televisionPrefab;
+    public GameObject cabinetPrefab;
+    public GameObject refrigeratorPrefab;
+    public GameObject sofaPrefab;
+    public GameObject sinkPrefab;
+
+    public string jsonFilePath = "detections.json";
+
+    void Start()
+    {
+        StartCoroutine(LoadJsonData());
+        // Get the camera's localToWorldMatrix
+        Matrix4x4 localToWorldMatrix = Camera.main.transform.localToWorldMatrix;
+        // Print the matrix to the console
+        Debug.Log("localToWorldMatrix:\n" + localToWorldMatrix);
+        // Get the camera's rotation as a Quaternion
+        Quaternion cameraRotation = Camera.main.transform.rotation;
+        // If you want to convert this quaternion to Euler angles (in degrees)
+        Vector3 cameraEulerAngles = cameraRotation.eulerAngles;
+        Debug.Log("Camera Rotation (Euler): " + cameraEulerAngles);
+    }
+
+    private IEnumerator LoadJsonData()
+    {
+        // Check if the file exists
+        if (File.Exists(jsonFilePath))
+        {
+            // Read the JSON data from the file
+            string jsonData = File.ReadAllText(jsonFilePath);
+            DetectionList detectionList = JsonUtility.FromJson<DetectionList>(jsonData);
+            // Create bounding boxes for all detections
+            foreach (var detection in detectionList.detections)
+            {
+                CreateBoundingBox(detection);
+            }
+        }
+        else
+        {
+            Debug.LogError("JSON file not found at: " + jsonFilePath);
+        }
+        yield return null; // Ensure coroutine has a yield
+    }
+
+    private void CreateBoundingBox(Detection detection)
+    {
+        GameObject objectToInstantiate = null;
+        // Determine which prefab to instantiate based on the category
+        switch (detection.category.ToLower())  // Case-insensitive match
+        {
+            case "box":
+                objectToInstantiate = boundingBoxPrefab;
+                break;
+            case "car":
+                objectToInstantiate = boundingBoxPrefab;
+                break;
+            case "table":
+                objectToInstantiate = tablePrefab;
+                break;
+            case "chair":
+                objectToInstantiate = chairPrefab;
+                break;
+            case "desk":
+                objectToInstantiate = deskPrefab;
+                break;
+            case "television":
+                objectToInstantiate = televisionPrefab;
+                break;
+            case "cabinet":
+                objectToInstantiate = cabinetPrefab;
+                break;
+            case "sofa":
+                objectToInstantiate = sofaPrefab;
+                break;
+            case "refrigerator":
+                objectToInstantiate = refrigeratorPrefab;
+                break;
+            case "sink":
+                objectToInstantiate = sinkPrefab;
+                break;
+            default:
+                objectToInstantiate = boundingBoxPrefab; // Default to the bounding box for other categories
+                Debug.LogWarning("No specific prefab for category: " + detection.category + ". Using default bounding box.");
+                break;
+        }
+
+        if (objectToInstantiate != null)
+        {
+            GameObject obj = Instantiate(objectToInstantiate);
+            // Log category for debugging
+            Debug.Log($"Category: {detection.category}");
+            // Set position using raw Y without adjustment
+            Vector3 cameraSpacePosition = new Vector3(
+                -detection.center_cam[0], // X coordinate in camera space
+                -detection.center_cam[1], // Raw Y position
+                detection.center_cam[2] // Z coordinate in camera space (depth)
+            );
+            // Convert from camera space to world space
+            Vector3 worldSpacePosition = Camera.main.transform.TransformPoint(cameraSpacePosition);
+            obj.transform.position = worldSpacePosition;
+            // Set scale (dimensions) if using the bounding box prefab
+            if (objectToInstantiate == boundingBoxPrefab)
+            {
+                obj.transform.localScale = new Vector3(
+                    detection.dimensions[0],
+                    detection.dimensions[1],
+                    detection.dimensions[2]
+                );
+            }
+            // Set rotation using Euler angles from the pose matrix
+            if (detection.pose1 != null && detection.pose2 != null && detection.pose3 != null)
+            {
+                float[][] matrix = new float[3][];
+                matrix[2] = detection.pose1;
+                matrix[1] = detection.pose2;
+                matrix[0] = detection.pose3;
+                // Convert the matrix to Euler angles
+                Vector3 eulerRotation = MatrixToEuler(matrix, detection.category);
+                // Convert Euler angles from camera space to world space
+                Quaternion cameraSpaceQuaternion = Quaternion.Euler(eulerRotation);
+                // Combine the camera's rotation with the object's rotation
+                obj.transform.rotation = Camera.main.transform.rotation * cameraSpaceQuaternion;
+            }
+            // Optionally: Apply color to the bounding box and all children
+            if (detection.color != null && detection.color.Length == 3)
+            {
+                Color newColor = new Color(detection.color[2], detection.color[1], detection.color[0], 1f);
+                // Function to apply color to a GameObject and all its children
+                void ApplyColorToAllChildren(GameObject obj, Color color)
+                {
+                    // Apply color to the current object
+                    Renderer renderer = obj.GetComponent<Renderer>();
+                    if (renderer != null)
+                    {
+                        // Check if the object has multiple materials
+                        if (renderer.materials.Length > 1)
+                        {
+                            // Apply color to all materials
+                            Material[] materials = renderer.materials;
+                            for (int i = 0; i < materials.Length; i++)
+                            {
+                                materials[i].color = color;
+                            }
+                        }
+                        else
+                        {
+                            // Apply color to the single material
+                            renderer.material.color = color;
+                        }
+                    }
+                    // Recursively apply color to all children
+                    foreach (Transform child in obj.transform)
+                    {
+                        ApplyColorToAllChildren(child.gameObject, color);
+                    }
+                }
+                // Apply color to the parent object and its children
+                ApplyColorToAllChildren(obj, newColor);
+            }
+            // Optionally: Add TextMeshPro for category and score display if using the bounding box
+            if (objectToInstantiate == boundingBoxPrefab)
+            {
+                TextMeshPro textMeshPro = obj.GetComponentInChildren<TextMeshPro>();
+                if (textMeshPro != null)
+                {
+                    textMeshPro.text = $"{detection.category}\nScore: {detection.score:F2}";
+                }
+            }
+        }
+        else
+        {
+            Debug.LogWarning("Prefab for category not found.");
+        }
+    }
+
+    private Vector3 MatrixToEuler(float[][] matrix, string category)
+    {
+        // Convert the rotation matrix to Euler angles
+        // You can implement the conversion logic based on your specific matrix format
+        // This is a placeholder implementation
+        float yaw = Mathf.Atan2(matrix[2][0], matrix[2][2]) * Mathf.Rad2Deg;
+        float pitch = Mathf.Atan2(-matrix[2][1], Mathf.Sqrt(matrix[2][0] * matrix[2][0] + matrix[2][2] * matrix[2][2])) * Mathf.Rad2Deg;
+        float roll = Mathf.Atan2(matrix[1][0], matrix[0][0]) * Mathf.Rad2Deg;
+        //yaw -= 90.0f;
+        pitch = pitch * 0;
+        roll = roll * 0;
+        //Adjust rotation for televisions
+        if (category.Equals("television", System.StringComparison.OrdinalIgnoreCase))
+        {
+            pitch = 180f; // Set X-axis rotation to 180
+            yaw = yaw + 60f; // Add 60 degrees to Y-axis rotation
+            roll = 90f; // Set Z-axis rotation to 90
+        }
+        return new Vector3(pitch, yaw, roll);
+    }
+}
