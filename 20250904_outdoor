@@ -1,0 +1,779 @@
+import os
+import numpy as np
+import torch
+import cv2
+from PIL import Image
+from pathlib import Path
+from tqdm import trange
+from ultralytics import YOLO
+import plotly.graph_objects as go
+from scipy.spatial.distance import directed_hausdorff
+from scipy.stats import mode
+from scipy.spatial.transform import Rotation as R
+import pickle
+import open3d as o3d
+import sys
+import logging
+import json
+import random
+# Set matplotlib backend early to avoid segfault in headless environments
+import matplotlib as mpl
+mpl.use('Agg')
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+# CubeRCNN imports for OV-Mono3D
+from detectron2.config import get_cfg
+from cubercnn.config import get_cfg_defaults
+from cubercnn.modeling.meta_arch import build_model
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.data import transforms as T
+from cubercnn import util, vis
+from cubercnn.modeling.backbone.dino import build_dino_backbone
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+sys.dont_write_bytecode = True
+sys.path.append(os.getcwd())
+np.set_printoptions(suppress=True)
+# Configuration
+# DATASET_ROOT = r"/root/ovmono3d/indoor_data"
+# SCENE_ID = "data11"
+# OUTPUT_DIR = "/root/ovmono3d/indoor_data/data11/output"
+# POSE_FILE = r"/root/ovmono3d/indoor_data/data11/traj.txt"
+# INTRINSICS_FILE = r"/root/ovmono3d/indoor_data/data11/intrinsics.txt"
+DATASET_ROOT = r"/root/ovmono3d/outdoor_data"
+SCENE_ID = "data2"
+OUTPUT_DIR = "/root/ovmono3d/outdoor_data/data2/output2"
+POSE_FILE = r"/root/ovmono3d/outdoor_data/data2/traj.txt"
+INTRINSICS_FILE = r"/root/ovmono3d/outdoor_data/data2/intrinsics.txt"
+MERGE_POSITION_THRESHOLD = 0.5
+IOU_THRESHOLD = 0.05
+CONFIDENCE_THRESHOLD = 0.65
+IMAGE_HEIGHT =720
+IMAGE_WIDTH = 1280
+START_FRAME = 0
+END_FRAME = -1
+STRIDE = 1
+VIDEO_FPS = 30
+SMOOTHING_WINDOW = 5
+BASELINE_THRESHOLD = 1 # meters for keyframe selection
+GRID_SIZE = 3 # e.g., 3x3 grid inside bbox for point projection
+# OV-Mono3D configuration
+CONFIG_FILE = "configs/OVMono3D_dinov2_SFP.yaml"
+WEIGHTS_FILE = "checkpoints/ovmono3d_lift.pth"
+CATEGORY_NAMES = ['car','motorcycle']
+# Disable torch gradient computation
+torch.set_grad_enabled(False)
+def load_intrinsics(intrinsics_file):
+    try:
+        intrinsics = np.loadtxt(intrinsics_file, dtype=np.float32)
+        if intrinsics.shape != (3, 3):
+            raise ValueError(f"Invalid intrinsics shape in {intrinsics_file}: {intrinsics.shape}")
+        return intrinsics
+    except Exception as e:
+        raise ValueError(f"Failed to load intrinsics from {intrinsics_file}: {e}")
+def load_dataset(dataset_root, scene_id, pose_file, intrinsics_file, start, end, stride, image_height, image_width):
+    rgb_dir = Path(dataset_root) / scene_id / "rgb"
+    depth_dir = Path(dataset_root) / scene_id / "depth"
+    rgb_files = sorted(rgb_dir.glob("*.jpg"))
+    depth_files = sorted(depth_dir.glob("*.png"))
+    if not rgb_files or not depth_files:
+        raise FileNotFoundError(
+            f"Missing files in dataset: rgb={len(rgb_files)}, depth={len(depth_files)}"
+        )
+    try:
+        poses = np.loadtxt(pose_file).reshape(-1, 4, 4)
+    except Exception as e:
+        raise ValueError(f"Failed to load poses from {pose_file}: {e}")
+    intrinsics = load_intrinsics(intrinsics_file)
+    num_rgb = len(rgb_files)
+    num_depth = len(depth_files)
+    num_poses = poses.shape[0]
+    if num_rgb != num_depth or num_rgb != num_poses:
+        raise ValueError(
+            f"Mismatched file counts: rgb={num_rgb}, depth={num_depth}, poses={num_poses}"
+        )
+    end = num_rgb if end == -1 else min(end, num_rgb)
+    frame_indices = list(range(start, end, stride))
+    logger.info(f"Processing {len(frame_indices)} frames (indices {frame_indices[0]} to {frame_indices[-1]})")
+    logger.info(f"RGB files: {num_rgb}, Depth files: {num_depth}, Poses: {num_poses}")
+    dataset = []
+    for idx in frame_indices:
+        rgb_path = rgb_files[idx]
+        depth_path = depth_files[idx]
+        pose = poses[idx]
+        if pose.shape != (4, 4):
+            raise ValueError(f"Invalid pose shape for frame {idx} in {pose_file}: {pose.shape}")
+        rgb_image = util.imread(str(rgb_path)) # Use util.imread for BGR loading
+        if rgb_image.shape[:2] != (image_height, image_width):
+            rgb_image = cv2.resize(rgb_image, (image_width, image_height))
+        # Try OpenCV first for depth
+        depth_image = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth_image is None:
+            logger.warning(f"OpenCV failed to load depth image {depth_path} (likely CRC error). Trying Pillow fallback.")
+            try:
+                pil_img = Image.open(str(depth_path))
+                depth_image = np.array(pil_img)
+                if depth_image.ndim != 2: # Ensure it's grayscale (depth should be single-channel)
+                    depth_image = cv2.cvtColor(depth_image, cv2.COLOR_RGB2GRAY) # Convert if needed
+                logger.info(f"Successfully loaded {depth_path} with Pillow fallback.")
+            except Exception as e:
+                logger.error(f"Failed to load depth image {depth_path} with both OpenCV and Pillow: {str(e)}. Skipping frame {idx}.")
+                continue
+        if depth_image.shape != (image_height, image_width):
+            depth_image = cv2.resize(depth_image, (image_width, image_height), interpolation=cv2.INTER_NEAREST)
+        depth_image = depth_image.astype(np.float32) / 1000.0
+        dataset.append({
+            "rgb_path": rgb_path,
+            "rgb": rgb_image,
+            "depth": depth_image,
+            "pose": pose,
+            "intrinsics": intrinsics,
+            "frame_idx": idx
+        })
+    return dataset
+def smooth_positions(positions, window=SMOOTHING_WINDOW):
+    if len(positions) < 2:
+        return positions
+    positions = np.array(positions)
+    smoothed = np.zeros_like(positions)
+    half_window = window // 2
+    for i in range(len(positions)):
+        start = max(0, i - half_window)
+        end = min(len(positions), i + half_window + 1)
+        smoothed[i] = np.mean(positions[start:end], axis=0)
+    return smoothed.tolist()
+def validate_bbox(bbox, image_width, image_height):
+    """Validate bounding box coordinates."""
+    x1, y1, x2, y2 = bbox
+    if not (0 <= x1 < x2 <= image_width and 0 <= y1 < y2 <= image_height):
+        logger.warning(f"Invalid bbox: {bbox} for image size ({image_width}, {image_height})")
+        return False
+    return True
+def get_3d_box_from_ovmono3d(model, cfg, rgb, K, bbox, class_index, threshold=CONFIDENCE_THRESHOLD):
+    """Run OV-Mono3D on a single frame and single bounding box to get 3D box."""
+    try:
+        bbox_np = np.expand_dims(bbox.astype(np.float32), axis=0)
+        oracle2D = {
+            'gt_bbox2D': torch.from_numpy(bbox_np).cuda(),
+            'gt_classes': torch.tensor([class_index], dtype=torch.int64).cuda(),
+            'gt_scores': torch.tensor([1.0], dtype=torch.float32).cuda()
+        }
+        aug_input = T.AugInput(rgb)
+        augmentations = T.AugmentationList([T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MAX_SIZE_TEST, "choice")])
+        _ = augmentations(aug_input)
+        image = aug_input.image
+        batched = [{
+            'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).cuda(),
+            'height': rgb.shape[0], 'width': rgb.shape[1], 'K': K, 'category_list': CATEGORY_NAMES, 'oracle2D': oracle2D
+        }]
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=False):
+                dets = model(batched)[0]['instances']
+        logger.info(f"Number of detections: {len(dets)}, Scores: {dets.scores.cpu().numpy() if len(dets) > 0 else []}")
+        if len(dets) == 0:
+            logger.warning("No detections found by OV-Mono3D")
+            return None, None, None, None, None, None
+        mask = dets.scores >= threshold
+        dets = dets[mask]
+        if len(dets) == 0:
+            logger.warning(f"No detections above threshold {threshold}")
+            return None, None, None, None, None, None
+        best_idx = dets.scores.argmax()
+        center_cam = np.array(dets.pred_center_cam[best_idx].float().cpu().numpy(), dtype=np.float32, copy=True)
+        dimensions = np.array(dets.pred_dimensions[best_idx].float().cpu().numpy(), dtype=np.float32, copy=True)
+        pose = np.array(dets.pred_pose[best_idx].float().cpu().numpy(), dtype=np.float32, copy=True)
+        pred_class_idx = dets.pred_classes[best_idx].item()
+        pred_score = dets.scores[best_idx].item()
+        # Generate combine image inside this function if needed
+        class_name = CATEGORY_NAMES[pred_class_idx]
+        score = pred_score
+        meshes = []
+        meshes_text = []
+        bbox3D = np.concatenate((center_cam, dimensions)).tolist()
+        color = [c/255.0 for c in util.get_color(0)]
+        box_mesh = util.mesh_cuboid(bbox3D, get_rotation_matrix(pose).tolist(), color=color)  # Convert pose to 3x3 if needed
+        meshes.append(box_mesh)
+        meshes_text.append(f"{class_name} {score:.2f}")
+        rgb = np.ascontiguousarray(rgb.astype(np.uint8)) if rgb.dtype != np.uint8 else np.ascontiguousarray(rgb)
+        K = np.ascontiguousarray(K.astype(np.float32))
+        im_drawn_rgb, im_topdown, _ = vis.draw_scene_view(
+            rgb, K, meshes, text=meshes_text, scale=rgb.shape[0], blend_weight=0.5, blend_weight_overlay=0.85
+        )
+        im_concat = np.concatenate((im_drawn_rgb, im_topdown), axis=1)
+        return center_cam, dimensions, pose, pred_class_idx, pred_score, im_concat
+    except Exception as e:
+        logger.error(f"Error in get_3d_box_from_ovmono3d: {str(e)}")
+        return None, None, None, None, None, None
+def get_rotation_matrix(rotation):
+    rotation = np.array(rotation)
+    if rotation.ndim == 2 and rotation.shape == (3, 3):
+        return rotation
+    elif rotation.ndim == 1 and rotation.size == 9:
+        return rotation.reshape(3, 3)
+    elif rotation.ndim == 1 and rotation.size == 6:
+        rot = rotation.reshape(2, 3)
+        b1 = rot[0] / np.linalg.norm(rot[0])
+        b3 = np.cross(b1, rot[1])
+        b3 /= np.linalg.norm(b3)
+        b2 = np.cross(b3, b1)
+        return np.vstack((b1, b2, b3))
+    else:
+        raise ValueError(f"Unknown rotation shape: {rotation.shape}")
+def create_obb_from_world(center_world, dimensions, rotation):
+    try:
+        rotation_matrix = get_rotation_matrix(rotation)
+        # Apply correction for 90-degree rotation around Y-axis
+        r_correct = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
+        rotation_matrix = rotation_matrix @ r_correct
+        half_dims = dimensions / 2
+        corners_local = np.array([
+            [-half_dims[0], -half_dims[1], -half_dims[2]],
+            [half_dims[0], -half_dims[1], -half_dims[2]],
+            [half_dims[0], half_dims[1], -half_dims[2]],
+            [-half_dims[0], half_dims[1], -half_dims[2]],
+            [-half_dims[0], -half_dims[1], half_dims[2]],
+            [half_dims[0], -half_dims[1], half_dims[2]],
+            [half_dims[0], half_dims[1], half_dims[2]],
+            [-half_dims[0], half_dims[1], half_dims[2]],
+        ])
+        corners_world = (rotation_matrix @ corners_local.T).T + center_world
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(corners_world)
+        obb = pcd.get_oriented_bounding_box()
+        return obb
+    except Exception as e:
+        logger.error(f"Error in create_obb_from_world: {str(e)}")
+        return None
+def compute_aabb_iou(aabb1, aabb2):
+    if aabb1 is None or aabb2 is None:
+        return 0.0
+    min1 = aabb1.min_bound
+    max1 = aabb1.max_bound
+    min2 = aabb2.min_bound
+    max2 = aabb2.max_bound
+    inter_min = np.maximum(min1, min2)
+    inter_max = np.minimum(max1, max2)
+    inter_dims = np.maximum(0, inter_max - inter_min)
+    inter_vol = np.prod(inter_dims)
+    if inter_vol == 0:
+        return 0.0
+    vol1 = aabb1.volume()
+    vol2 = aabb2.volume()
+    union_vol = vol1 + vol2 - inter_vol
+    return inter_vol / union_vol
+def plot_global_topview(world_boxes, output_path):
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    for box in world_boxes:
+        center = box['center_world']
+        dims = box['dimensions']
+        rot = box['rotation_world']
+        half_dims = dims / 2
+        corners_local = np.array([
+            [hx, hy, hz]
+            for hx in [-half_dims[0], half_dims[0]]
+            for hy in [-half_dims[1], half_dims[1]]
+            for hz in [-half_dims[2], half_dims[2]]
+        ])
+        corners = (rot @ corners_local.T).T + center
+        edges = [
+            [0,1], [1,3], [3,2], [2,0], # bottom
+            [4,5], [5,7], [7,6], [6,4], # top
+            [0,4], [1,5], [2,6], [3,7] # sides
+        ]
+        for e in edges:
+            ax.plot(corners[e, 0], corners[e, 1], corners[e, 2], 'b-')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.view_init(elev=90, azim=0) # Top-down view
+    # Auto-set limits
+    if world_boxes:
+        all_points = np.vstack([box['center_world'] for box in world_boxes])
+        margin = np.max([box['dimensions'] for box in world_boxes], axis=0) / 2 + 1
+        min_p = np.min(all_points, axis=0) - margin
+        max_p = np.max(all_points, axis=0) + margin
+        ax.set_xlim(min_p[0], max_p[0])
+        ax.set_ylim(min_p[1], max_p[1])
+        ax.set_zlim(min_p[2], max_p[2])
+    plt.savefig(output_path)
+    plt.close()
+def deproject_point(u, v, depth, intrinsics, pose):
+    if depth <= 0 or np.isnan(depth) or np.isinf(depth):
+        return None
+    z = depth
+    x = (u - intrinsics[0, 2]) * z / intrinsics[0, 0]
+    y = (v - intrinsics[1, 2]) * z / intrinsics[1, 1]
+    point_camera = np.array([x, y, z, 1.0])
+    point_world = pose @ point_camera
+    if np.any(np.isnan(point_world)) or np.any(np.isinf(point_world)):
+        return None
+    return point_world[:3]
+def calculate_distance_to_first_cam(center_world, first_cam_pos):
+    """
+    Calculate the Euclidean distance from the object's world center to the camera position at the first frame.
+   
+    Args:
+    center_world (np.array): 3D world coordinates of the object center.
+    first_cam_pos (np.array): 3D world coordinates of the camera at the first frame.
+   
+    Returns:
+    float: Euclidean distance in meters.
+    """
+    return np.linalg.norm(center_world - first_cam_pos)
+def main():
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    visualizations_dir = output_dir / "visualizations"
+    visualizations_dir.mkdir(parents=True, exist_ok=True)
+    yolo_model = YOLO('yolov8l-world.pt')
+    yolo_model.set_classes(CATEGORY_NAMES)
+    video_path = output_dir / 'tracking_video.mp4'
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(str(video_path), fourcc, VIDEO_FPS, (IMAGE_WIDTH, IMAGE_HEIGHT))
+    dataset = load_dataset(
+        dataset_root=DATASET_ROOT,
+        scene_id=SCENE_ID,
+        pose_file=POSE_FILE,
+        intrinsics_file=INTRINSICS_FILE,
+        start=START_FRAME,
+        end=END_FRAME,
+        stride=STRIDE,
+        image_height=IMAGE_HEIGHT,
+        image_width=IMAGE_WIDTH
+    )
+    # Get first camera position
+    if dataset:
+        first_cam_pos = dataset[0]['pose'][:3, 3]
+        logger.info(f"First camera position: {first_cam_pos}")
+    else:
+        logger.warning("No frames in dataset, cannot compute first camera position.")
+        first_cam_pos = np.array([0.0, 0.0, 0.0]) # Default to origin if no data
+    tracks = {}
+    ovmono_cache = {} # Cache: (frame_idx, bbox_tuple): (center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat)
+    for frame_idx in trange(len(dataset)):
+        frame = dataset[frame_idx]
+        rgb_path = frame["rgb_path"]
+        image_rgb = frame["rgb"]
+        depth_array = frame["depth"]
+        pose = frame["pose"]
+        intrinsics = frame["intrinsics"]
+        results = yolo_model.track(source=str(rgb_path), conf=CONFIDENCE_THRESHOLD, verbose=False, persist=True)
+        detections = results[0].boxes
+        xyxy = detections.xyxy.cpu().numpy()
+        confidences = detections.conf.cpu().numpy()
+        track_ids = detections.id.cpu().numpy() if detections.id is not None else np.arange(len(xyxy))
+        class_ids = detections.cls.cpu().numpy().astype(int)
+        class_names_detected = [CATEGORY_NAMES[class_id] for class_id in class_ids]
+        annotated_frame = image_rgb.copy()
+        for i, (bbox, conf, track_id, class_name) in enumerate(zip(xyxy, confidences, track_ids, class_names_detected)):
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"{class_name} ID:{int(track_id)} Conf:{conf:.2f}"
+            cv2.putText(
+                annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 0), 2
+            )
+        video_writer.write(annotated_frame)
+        for i, (bbox, conf, track_id, class_id, class_name) in enumerate(zip(xyxy, confidences, track_ids, class_ids, class_names_detected)):
+            track_id = int(track_id)
+  
+            if track_id not in tracks:
+                tracks[track_id] = {
+                    'centers': [], # deprojected centers for trajectory plotting
+                    'point_cloud': [], # grid points for merging
+                    'bboxes': [],
+                    'confidences': [],
+                    'class_ids': [],
+                    'frame_indices': [],
+                    'best_conf': 0.0,
+                    'best_frame_idx': None
+                }
+  
+            x1, y1, x2, y2 = map(int, bbox)
+            # Deproject center
+            center_y = (y1 + y2) / 2
+            center_x = (x1 + x2) / 2
+            depth = depth_array[int(center_y), int(center_x)]
+            center_world = deproject_point(center_x, center_y, depth, intrinsics, pose)
+            if center_world is not None:
+                tracks[track_id]['centers'].append(center_world)
+      
+            # Deproject grid points inside bbox
+            us = np.linspace(x1, x2 - 1, GRID_SIZE, dtype=int)
+            vs = np.linspace(y1, y2 - 1, GRID_SIZE, dtype=int)
+            for u in us:
+                for v in vs:
+                    depth = depth_array[v, u]
+                    point_world = deproject_point(u, v, depth, intrinsics, pose)
+                    if point_world is not None:
+                        tracks[track_id]['point_cloud'].append(point_world)
+  
+            tracks[track_id]['bboxes'].append(bbox)
+            tracks[track_id]['confidences'].append(conf)
+            tracks[track_id]['class_ids'].append(class_id)
+            tracks[track_id]['frame_indices'].append(frame_idx)
+  
+            if conf > tracks[track_id]['best_conf']:
+                tracks[track_id]['best_conf'] = conf
+                tracks[track_id]['best_frame_idx'] = frame_idx
+    video_writer.release()
+    # Compute fused 3D box for each track using keyframes with sufficient baseline
+    for track_id, track_data in list(tracks.items()):
+        if track_data['best_conf'] < CONFIDENCE_THRESHOLD or len(track_data['centers']) < 3:
+            logger.info(f"Skipping track {track_id}: best_conf={track_data['best_conf']:.2f}, centers={len(track_data['centers'])}")
+            del tracks[track_id]
+            continue
+  
+        # Sort frames
+        sorted_indices = sorted(range(len(track_data['frame_indices'])), key=lambda k: track_data['frame_indices'][k])
+        sorted_frames = [track_data['frame_indices'][si] for si in sorted_indices]
+        sorted_poses = [dataset[f]['pose'] for f in sorted_frames]
+  
+        # Select keyframes based on baseline
+        key_indices = [0]
+        prev_pose = sorted_poses[0]
+        for k in range(1, len(sorted_poses)):
+            baseline = np.linalg.norm(sorted_poses[k][:3, 3] - prev_pose[:3, 3])
+            if baseline > BASELINE_THRESHOLD:
+                key_indices.append(k)
+                prev_pose = sorted_poses[k]
+  
+        if not key_indices:
+            del tracks[track_id]
+            continue
+  
+        centers_world = []
+        dims_list = []
+        rots_world = []
+        classes_k = []
+        scores_k = []
+        im_concats = [] # To save one later
+  
+        for ki in key_indices:
+            kf = sorted_frames[ki]
+            idx_in_track = sorted_indices[ki] # Original index in lists
+            bbox = track_data['bboxes'][idx_in_track]
+            class_id = track_data['class_ids'][idx_in_track]
+            frame = dataset[kf]
+            rgb = frame['rgb']
+            K = frame['intrinsics']
+            pose = frame['pose']
+      
+            cache_key = (kf, tuple(bbox))
+            if cache_key in ovmono_cache:
+                center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat = ovmono_cache[cache_key]
+            else:
+                center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat = get_3d_box_from_ovmono3d(model, cfg, rgb, K, bbox, class_id)
+                ovmono_cache[cache_key] = (center_cam, dimensions, rotation, pred_class_idx, pred_score, im_concat)
+            if center_cam is None:
+                continue
+      
+            center_homog = np.append(center_cam, 1.0)
+            center_world = (pose @ center_homog)[:3]
+            rotation_matrix = get_rotation_matrix(rotation)
+            rotation_world = pose[:3, :3] @ rotation_matrix
+      
+            centers_world.append(center_world)
+            dims_list.append(dimensions)
+            rots_world.append(rotation_world)
+            classes_k.append(pred_class_idx)
+            scores_k.append(pred_score)
+            im_concats.append((im_concat, pred_score)) # To select best
+  
+        if not centers_world:
+            logger.warning(f"Track {track_id}: No valid OV-Mono3D estimates from keyframes")
+            del tracks[track_id]
+            continue
+  
+        # Fuse
+        fused_class = mode(classes_k).mode.item() if len(mode(classes_k).mode) > 0 else classes_k[0]
+        fused_score = max(scores_k)
+        fused_center = np.mean(centers_world, axis=0)
+        fused_dims = np.mean(dims_list, axis=0)
+        quats = [R.from_matrix(r).as_quat() for r in rots_world]
+        fused_quat = np.mean(quats, axis=0)
+        fused_quat /= np.linalg.norm(fused_quat)
+        fused_rot = R.from_quat(fused_quat).as_matrix()
+  
+        track_data['best_box_world'] = {
+            'center_world': fused_center,
+            'dimensions': fused_dims,
+            'rotation_world': fused_rot,
+            'class_idx': fused_class,
+            'score': fused_score
+        }
+  
+        obb = create_obb_from_world(fused_center, fused_dims, fused_rot)
+        if obb is None:
+            del tracks[track_id]
+            continue
+        track_data['obb'] = obb
+  
+        # Save im_concat from the keyframe with highest score
+        best_im_idx = np.argmax([s for _, s in im_concats])
+        im_concat = im_concats[best_im_idx][0]
+        combine_path = visualizations_dir / f"track_{track_id}_combine.jpg"
+        if im_concat is not None and im_concat.dtype == np.float32:
+            im_concat = (im_concat * 255).clip(0, 255).astype(np.uint8)
+        util.imwrite(im_concat, str(combine_path))
+        logger.info(f"Saved combine image for track {track_id} to {combine_path}")
+    # Now, improved merging using position, class, and AABB IoU with union-find for transitive merging
+    track_ids = list(tracks.keys())
+    if track_ids:
+        classes = [tracks[tid]['best_box_world']['class_idx'] for tid in track_ids]
+        obbs = [tracks[tid]['obb'] for tid in track_ids]
+        positions_list = [np.array(tracks[tid]['point_cloud']) for tid in track_ids]
+        # Union-find structures
+        parents = {tid: tid for tid in track_ids}
+        def find(x):
+            if parents[x] != x:
+                parents[x] = find(parents[x])
+            return parents[x]
+        def union(x, y):
+            px = find(x)
+            py = find(y)
+            if px != py:
+                parents[px] = py
+        for i in range(len(track_ids)):
+            for j in range(i + 1, len(track_ids)):
+                tid1 = track_ids[i]
+                tid2 = track_ids[j]
+                pos1 = positions_list[i]
+                pos2 = positions_list[j]
+                if len(pos1) == 0 or len(pos2) == 0:
+                    continue
+                haus_ab = directed_hausdorff(pos1, pos2)[0]
+                haus_ba = directed_hausdorff(pos2, pos1)[0]
+                haus = max(haus_ab, haus_ba)
+                class1 = classes[i]
+                class2 = classes[j]
+                if haus < MERGE_POSITION_THRESHOLD * 2: # Log for close pairs even if not merging
+                    aabb1 = obbs[i].get_axis_aligned_bounding_box()
+                    aabb2 = obbs[j].get_axis_aligned_bounding_box()
+                    iou = compute_aabb_iou(aabb1, aabb2)
+                    log_msg = f"Potential merge between {tid1} and {tid2}: haus_dist={haus:.3f}, class1={class1}, class2={class2}, iou={iou:.3f}"
+                    if haus < MERGE_POSITION_THRESHOLD and class1 == class2 and iou > IOU_THRESHOLD:
+                        union(tid1, tid2)
+                        log_msg += " -> MERGED"
+                    else:
+                        log_msg += " -> NOT MERGED (check thresholds)"
+                    logger.info(log_msg)
+        # Group by roots
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for tid in track_ids:
+            groups[find(tid)].append(tid)
+        # Merge groups
+        for root, members in groups.items():
+            if len(members) <= 1:
+                continue
+            for mem in members:
+                if mem == root:
+                    continue
+                tracks[root]['centers'].extend(tracks[mem]['centers'])
+                tracks[root]['point_cloud'].extend(tracks[mem]['point_cloud'])
+                tracks[root]['bboxes'].extend(tracks[mem]['bboxes'])
+                tracks[root]['confidences'].extend(tracks[mem]['confidences'])
+                tracks[root]['class_ids'].extend(tracks[mem]['class_ids'])
+                tracks[root]['frame_indices'].extend(tracks[mem]['frame_indices'])
+                if tracks[mem]['best_conf'] > tracks[root]['best_conf']:
+                    tracks[root]['best_conf'] = tracks[mem]['best_conf']
+                    tracks[root]['best_frame_idx'] = tracks[mem]['best_frame_idx']
+                    tracks[root]['best_box_world'] = tracks[mem]['best_box_world']
+                    tracks[root]['obb'] = tracks[mem]['obb']
+            for mem in members:
+                if mem != root:
+                    del tracks[mem]
+    # Smooth centers after merging
+    for track_id in tracks:
+        if tracks[track_id]['centers']:
+            tracks[track_id]['centers'] = smooth_positions(tracks[track_id]['centers'], SMOOTHING_WINDOW)
+    # Use fused box for outputs
+    obb_meshes = []
+    world_boxes = []
+    for track_id, track_data in tracks.items():
+        if 'best_box_world' not in track_data:
+            continue
+        best_box = track_data['best_box_world']
+        world_boxes.append({
+            'center_world': best_box['center_world'],
+            'dimensions': best_box['dimensions'],
+            'rotation_world': best_box['rotation_world'],
+            'class_name': CATEGORY_NAMES[best_box['class_idx']],
+            'score': best_box['score'],
+            'track_id': track_id
+        })
+        obb = track_data['obb']
+        if obb is None:
+            continue
+        obb_mesh = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(obb, scale=[1, 1, 1])
+        obb_mesh.paint_uniform_color([0, 1, 0])
+        obb_file = output_dir / f'track_{track_id}_box.ply'
+        o3d.io.write_triangle_mesh(str(obb_file), obb_mesh, write_ascii=True, write_vertex_normals=False, write_vertex_colors=True)
+        logger.info(f"Saved OBB for track {track_id} to {obb_file}")
+        obb_meshes.append(obb_mesh)
+    if obb_meshes:
+        combined_obb_mesh = obb_meshes[0]
+        for mesh in obb_meshes[1:]:
+            combined_obb_mesh += mesh
+        # Add floor mesh
+        if world_boxes:
+            all_corners = []
+            bottom_ys = []
+            for box in world_boxes:
+                center = box['center_world']
+                dims = box['dimensions']
+                rot = box['rotation_world']
+                half_dims = dims / 2
+                corners_local = np.array([
+                    [-half_dims[0], -half_dims[1], -half_dims[2]],
+                    [half_dims[0], -half_dims[1], -half_dims[2]],
+                    [half_dims[0], half_dims[1], -half_dims[2]],
+                    [-half_dims[0], half_dims[1], -half_dims[2]],
+                    [-half_dims[0], -half_dims[1], half_dims[2]],
+                    [half_dims[0], -half_dims[1], half_dims[2]],
+                    [half_dims[0], half_dims[1], half_dims[2]],
+                    [-half_dims[0], half_dims[1], half_dims[2]],
+                ])
+                corners_world = (rot @ corners_local.T).T + center
+                all_corners.append(corners_world)
+                bottom_y = np.max(corners_world[:, 1])
+                bottom_ys.append(bottom_y)
+            all_points = np.vstack(all_corners)
+            min_x, min_y, min_z = np.min(all_points, axis=0)
+            max_x, max_y, max_z = np.max(all_points, axis=0)
+            global_max_bottom_y = np.max(bottom_ys) if bottom_ys else 0.0
+            margin = 1.0
+            floor_dim_x = max_z - min_z + margin * 2
+            floor_dim_z = max_x - min_x+ margin * 2
+            floor_thickness = 0.01 # Y
+            floor_y = global_max_bottom_y + floor_thickness / 2
+            floor_center = np.array([(min_x + max_x) / 2, floor_y, (min_z + max_z) / 2])
+            floor_dims = np.array([floor_dim_x, floor_thickness, floor_dim_z])
+            floor_rotation = np.eye(3)
+            floor_obb = create_obb_from_world(floor_center, floor_dims, floor_rotation)
+            if floor_obb is None:
+                logger.warning("Failed to create floor OBB")
+            else:
+                floor_mesh = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(floor_obb)
+                floor_mesh.paint_uniform_color([0.5, 0.5, 0.5])
+                combined_obb_mesh += floor_mesh
+                logger.info("Added floor mesh to combined PLY")
+        combined_obb_file = output_dir / 'all_bboxes_3d.ply'
+        o3d.io.write_triangle_mesh(
+            str(combined_obb_file),
+            combined_obb_mesh,
+            write_ascii=True,
+            write_vertex_normals=False,
+            write_vertex_colors=True
+        )
+        logger.info(f"Saved combined OBBs for {len(obb_meshes)} tracks to {combined_obb_file}")
+    # Remove unpicklable 'obb' objects before saving
+    for track_data in tracks.values():
+        if 'obb' in track_data:
+            del track_data['obb']
+    with open(output_dir / 'tracked_objects.pkl', 'wb') as f:
+        pickle.dump(tracks, f)
+    data = []
+    for track_id, track_data in tracks.items():
+        positions = np.array(track_data['centers'])
+        if len(positions) == 0:
+            continue
+        trace = go.Scatter3d(
+            x=positions[:, 0],
+            y=positions[:, 1],
+            z=positions[:, 2],
+            mode='markers',
+            name=f'Track {track_id} ({CATEGORY_NAMES[track_data["class_ids"][0]]})',
+            marker=dict(size=5)
+        )
+        data.append(trace)
+    layout = go.Layout(
+        title='3D Object Tracks',
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+    fig = go.Figure(data=data, layout=layout)
+    fig.write_html(str(output_dir / 'tracked_points_3d.html'))
+    if world_boxes:
+        plot_global_topview(world_boxes, str(output_dir / 'global_topview.png'))
+        logger.info(f"Saved global top-view image to {output_dir / 'global_topview.png'}")
+    # NEW: Extract and save JSON in Unity-friendly format (inspired by DetAny3D's JSON output)
+    # This creates a single JSON for the entire 3D map, using fused world coordinates.
+    # To match the orientation in PLY files (which apply a rotation correction), apply the same correction to rotation and permute dimensions.
+    r_correct = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
+    detections = []
+    for box in world_boxes:
+        center = [float(c) for c in box['center_world']]
+        dims = box['dimensions']
+        # Permute dimensions to match the axis remapping from the correction: new_dims = [old_z, old_y, old_x]
+        dims_permuted = [float(dims[2]), float(dims[1]), float(dims[0])]
+        fused_rot = box['rotation_world']
+        # Apply correction to rotation
+        rot_corrected = np.dot(fused_rot, r_correct)
+        rot_mat = [[float(r) for r in row] for row in rot_corrected]
+        category = box['class_name']
+        score = float(box['score'])
+        color = [random.random(), random.random(), random.random()] # Random color (0-1)
+        # Calculate distance to first camera
+        dist = calculate_distance_to_first_cam(np.array(center), first_cam_pos)
+        det = {
+            "category": category,
+            "score": score,
+            "center_cam": center, # Using world coords
+            "dimensions": dims_permuted,
+            "pose1": rot_mat[0],
+            "pose2": rot_mat[1],
+            "pose3": rot_mat[2],
+            "color": color,
+            "distance_to_first_cam": float(dist)
+        }
+        detections.append(det)
+        logger.info(f"Object {category} (track {box['track_id']}): Distance to first cam = {dist:.2f} m")
+    # Add floor to JSON if computed
+    if 'floor_center' in locals() and 'floor_dims' in locals():
+        center = [float(floor_center[0]), float(floor_center[1]), float(floor_center[2])]
+        dims_permuted = [float(floor_dims[2]), float(floor_dims[1]), float(floor_dims[0])]
+        fused_rot = np.eye(3)
+        rot_corrected = np.dot(fused_rot, r_correct)
+        rot_mat = [[float(r) for r in row] for row in rot_corrected]
+        category = "floor"
+        score = 1.0
+        color = [0.5, 0.5, 0.5]
+        # Calculate distance for floor (optional, since it's derived)
+        dist = calculate_distance_to_first_cam(np.array(center), first_cam_pos)
+        det = {
+            "category": category,
+            "score": score,
+            "center_cam": center,
+            "dimensions": dims_permuted,
+            "pose1": rot_mat[0],
+            "pose2": rot_mat[1],
+            "pose3": rot_mat[2],
+            "color": color,
+            "distance_to_first_cam": float(dist)
+        }
+        detections.append(det)
+        logger.info(f"Floor: Distance to first cam = {dist:.2f} m")
+        logger.info("Added floor to Unity JSON")
+    json_path = output_dir / 'world_3d_map.json'
+    with open(json_path, 'w') as f:
+        json.dump({"detections": detections}, f, indent=4)
+    logger.info(f"Saved Unity-format JSON for 3D map to {json_path}")
+if __name__ == "__main__":
+    cfg = get_cfg()
+    get_cfg_defaults(cfg)
+    cfg.merge_from_file(CONFIG_FILE)
+    cfg.MODEL.ROI_HEADS.NAME = "ROIHeads3D"
+    cfg.MODEL.WEIGHTS = WEIGHTS_FILE
+    cfg.freeze()
+    model = build_model(cfg)
+    DetectionCheckpointer(model).load(cfg.MODEL.WEIGHTS)
+    model.eval()
+    main()
